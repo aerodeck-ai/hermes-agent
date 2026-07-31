@@ -215,22 +215,43 @@ def check_systemd_timing_alignment(
 
 
 def _systemd_timeout_stop_us(unit_name: str) -> Optional[int]:
-    """``TimeoutStopUSec`` of ``unit_name`` in microseconds; ``--user`` first (hermes' usual)."""
+    """``TimeoutStopUSec`` of ``unit_name`` in microseconds; ``--user`` first (hermes' usual).
+
+    ``systemctl show <unit>`` NEVER errors for a unit that isn't loaded under the manager you
+    queried — it returns rc=0 plus the compiled-in template defaults (``LoadState=not-found``,
+    ``TimeoutStopUSec=1min 30s``). Gateways installed as *system*-managed units (common in
+    production, confirmed live with real ``TimeoutStopSec`` overrides) would otherwise have their
+    ``--user`` query "succeed" with a bogus default and never reach the system manager where the
+    real value lives. We therefore also fetch ``LoadState`` and only trust a result whose unit is
+    actually loaded under the manager that answered. Estate fix, hermes-agent PR #2.
+    """
     for flag in (["--user"], []):
         try:
             result = subprocess.run(
-                ["systemctl", *flag, "show", unit_name, "--property=TimeoutStopUSec"],
+                [
+                    "systemctl", *flag, "show", unit_name,
+                    "--property=TimeoutStopUSec", "--property=LoadState",
+                ],
                 capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=2.0,
             )
         except (subprocess.TimeoutExpired, OSError):
             continue
-        # Output: "TimeoutStopUSec=1min 30s" or "TimeoutStopUSec=90000000"
-        for line in result.stdout.splitlines() if result.returncode == 0 else ():
-            if line.startswith("TimeoutStopUSec="):
+        if result.returncode != 0:
+            continue
+        # Output: "TimeoutStopUSec=1min 30s" / "TimeoutStopUSec=90000000"
+        # plus "LoadState=loaded" or "LoadState=not-found".
+        load_state: Optional[str] = None
+        value: Optional[str] = None
+        for line in result.stdout.splitlines():
+            if line.startswith("LoadState="):
+                load_state = line.split("=", 1)[1].strip()
+            elif line.startswith("TimeoutStopUSec="):
                 value = line.split("=", 1)[1].strip()
-                timeout_us = int(value) if value.isdigit() else parse_systemd_duration_to_us(value)
-                if timeout_us is not None:
-                    return timeout_us
+        if load_state == "not-found" or value is None:
+            continue
+        timeout_us = int(value) if value.isdigit() else parse_systemd_duration_to_us(value)
+        if timeout_us is not None:
+            return timeout_us
     return None
 
 
