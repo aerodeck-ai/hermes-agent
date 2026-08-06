@@ -1507,6 +1507,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             ("GET", "/v1/browser-control/ws", self._handle_browser_control_ws),
             ("POST", "/v1/artifacts/upload", self._handle_artifact_upload),
             ("GET", "/v1/artifacts/download/{artifact_id}", self._handle_artifact_download),
+            # Decision C debug endpoint — role-map resolution for the calling identity.
+            # Same Bearer-token auth as /v1/* routes. Read-only; never mutates state.
+            ("GET", "/debug/role-map", self._handle_debug_role_map),
             ("GET", "/v1/skills", self._handle_skills),
             ("GET", "/v1/toolsets", self._handle_toolsets),
             ("GET", "/api/sessions", self._handle_list_sessions),
@@ -1620,6 +1623,66 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         return raw, None
 
     # -- Session DB -------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # CF Access JWT helpers (Gap 1 — server-derived identity, CWE-862)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_cf_jwt_sub(request: "web.Request") -> Optional[str]:
+        """Extract the ``sub`` claim from a Cloudflare Access JWT.
+
+        The JWT in ``Cf-Access-Jwt-Assertion`` has already been validated at
+        the CF edge before the request reaches this server.  We do NOT re-verify
+        the signature here — we rely on the perimeter guarantee.  We only decode
+        the payload to extract the stable ``sub`` (email or opaque ID) so we can
+        derive a server-side session identity.
+
+        Returns the ``sub`` string on success, or ``None`` if the header is
+        absent, malformed, or lacks a ``sub`` claim.
+
+        NOTE: this is intentionally a best-effort decode.  A missing or
+        unparseable JWT falls through to the Bearer-token-only path (local dev /
+        non-CF deployments) rather than hard-rejecting the request.
+        """
+        raw_jwt = request.headers.get("Cf-Access-Jwt-Assertion", "").strip()
+        if not raw_jwt:
+            return None
+
+        try:
+            import base64
+            # JWT is three dot-separated base64url segments: header.payload.sig
+            parts = raw_jwt.split(".")
+            if len(parts) != 3:
+                return None
+
+            # Base64url decode payload (add padding as needed)
+            payload_b64 = parts[1]
+            padding = 4 - len(payload_b64) % 4
+            if padding != 4:
+                payload_b64 += "=" * padding
+            payload_bytes = base64.urlsafe_b64decode(payload_b64)
+            payload = json.loads(payload_bytes.decode("utf-8"))
+            sub = payload.get("sub") or payload.get("email")
+            if sub and isinstance(sub, str):
+                return sub
+        except Exception:
+            pass
+        return None
+
+    def _derive_session_id_from_cf_jwt(self, cf_sub: str, route: str) -> str:
+        """Build a deterministic, server-derived session ID from JWT identity.
+
+        Format: ``api_server:<cf_sub>:<route_hash>``
+
+        The route hash is a short fingerprint of the endpoint path so that
+        different API routes for the same user produce distinct sessions.
+        The full sub is included verbatim so operators can grep state.db by
+        email without decoding hashes.
+        """
+        route_hash = hashlib.sha1(route.encode(), usedforsecurity=False).hexdigest()[:8]
+        safe_sub = re.sub(r"[^a-zA-Z0-9@._+-]", "_", cf_sub)
+        return f"api_server:{safe_sub}:{route_hash}"
 
     def _open_and_cache_session_db(self, home) -> Optional[Any]:
         """Cached SessionDB for ``home`` (shared by both ``_ensure_session_db*``). Never writes
@@ -2227,6 +2290,88 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         except Exception:
             logger.exception("[%s] GET /api/model/options failed", self.name)
             return _error_response("Failed to list model options.", 500, code="model_options_failed")
+
+    async def _handle_debug_role_map(self, request: "web.Request") -> "web.Response":
+        """GET /debug/role-map — expose Decision C role-map resolution for review.
+
+        Query params (all optional):
+          entry_point   default "api_server"
+          identity      default = CF JWT sub if present, else "anonymous"
+          channel       default "*"
+
+        Returns: {role_map_active, profile, entry_point, identity, channel,
+                  resolved_role, allowed_toolsets (filtered universe sample),
+                  persona_overlay}
+
+        Same Bearer-token auth as /v1/* routes. Read-only; never mutates state.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        # Instantiate RoleMap directly from the active profile dir.
+        from pathlib import Path
+        from gateway.role_map import RoleMap
+        from hermes_cli.profiles import get_profile_dir, get_active_profile_name
+        profile_name = get_active_profile_name() or "default"
+        try:
+            role_map = RoleMap.from_profile_dir(Path(get_profile_dir(profile_name)))
+        except Exception as exc:
+            role_map = None
+            load_error = str(exc)
+        else:
+            load_error = None
+
+        # Query params with safe defaults
+        entry_point = request.query.get("entry_point", "api_server")
+        identity = request.query.get("identity")
+        if not identity:
+            try:
+                cf_sub = self._extract_cf_jwt_sub(request)
+                identity = cf_sub or "anonymous"
+            except Exception:
+                identity = "anonymous"
+        channel = request.query.get("channel", "*")
+
+        if role_map is None:
+            return web.json_response({
+                "object": "hermes.debug.role_map",
+                "role_map_active": False,
+                "profile": profile_name,
+                "load_error": load_error,
+                "note": "role_map = None on this profile (yamls absent OR init failed). Legacy full-catalog dispatch.",
+            })
+
+        try:
+            resolved_role = role_map.resolve_role(entry_point, identity, channel)
+            sample_universe = [
+                "memory", "hermes-cli", "telegram", "web", "code_execution",
+                "terminal", "browser", "delegate_to_subagent", "cronjob_create",
+                "vision", "image_generation", "tts", "weather", "github",
+                "jiddlers", "obsidian", "google_workspace",
+            ]
+            allowed = role_map.filter_catalog(sample_universe, resolved_role)
+            persona_overlay = role_map.persona_overlay(resolved_role)
+        except Exception as exc:
+            return web.json_response({
+                "object": "hermes.debug.role_map",
+                "role_map_active": True,
+                "error": str(exc),
+            }, status=500)
+
+        return web.json_response({
+            "object": "hermes.debug.role_map",
+            "role_map_active": True,
+            "profile": profile_name,
+            "entry_point": entry_point,
+            "identity": identity,
+            "channel": channel,
+            "resolved_role": resolved_role,
+            "allowed_from_sample_universe": allowed,
+            "sample_universe_size": len(sample_universe),
+            "persona_overlay": persona_overlay,
+            "note": "Read-only debug endpoint. Sample universe is illustrative — production filter uses _get_platform_tools() output.",
+        })
 
     @_require_auth
     async def _handle_capabilities(self, request: "web.Request") -> "web.Response":

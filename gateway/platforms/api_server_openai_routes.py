@@ -452,10 +452,47 @@ class OpenAICompatRoutesMixin:
         gateway_session_key, key_err = self._parse_session_key_header(request)
         if key_err is not None:
             return key_err
-        # X-Hermes-Session-Id continues an existing session (history from state.db, not the body);
-        # requires a configured API key or any client could read history by guessing ids.
+        # ------------------------------------------------------------------
+        # Session identity resolution (Gap 1 fix — CWE-862)
+        #
+        # Priority order (highest to lowest):
+        #   1. CF Access JWT present  → derive session_id server-side from JWT
+        #      sub.  Any caller-supplied X-Hermes-Session-Id is IGNORED when a
+        #      JWT is present; it cannot override a server-derived identity.
+        #   2. X-Hermes-Session-Id header + API key auth  → session continuation
+        #      (existing behaviour, preserved for local-dev / non-CF paths).
+        #   3. Fingerprint of (system_prompt, first_user_message)  → stateless.
+        #
+        # The CF-JWT path closes the cross-tenant impersonation hole: a caller
+        # with the Bearer token for profile A cannot hijack profile B's session
+        # by sending X-Hermes-Session-Id: <profile-B-session>.  When CF Access
+        # is in the path, the JWT is server-supplied and non-spoofable.
+        #
+        # Estate fix 13ed1cdd05, re-ported onto v2026.9.7: upstream extracted
+        # this handler out of api_server.py into this module, so the guard is
+        # re-applied here rather than at its original site.
+        # ------------------------------------------------------------------
+        cf_sub = self._extract_cf_jwt_sub(request)
         provided_session_id = request.headers.get("X-Hermes-Session-Id", "").strip()
-        if provided_session_id:
+        if cf_sub:
+            # Server-derived identity — caller cannot influence session_id.
+            session_id = self._derive_session_id_from_cf_jwt(cf_sub, request.path)
+            if provided_session_id and provided_session_id != session_id:
+                logger.warning(
+                    "X-Hermes-Session-Id %r overridden by CF JWT identity for sub=%r; "
+                    "derived session_id=%r. Cross-tenant impersonation attempt blocked.",
+                    provided_session_id, cf_sub, session_id,
+                )
+            try:
+                db = await self._ensure_session_db_async()
+                if db is not None:
+                    jwt_history = await asyncio.to_thread(
+                        db.get_messages_as_conversation, session_id)
+                    if jwt_history:
+                        history = jwt_history
+            except Exception as e:
+                logger.warning("Failed to load CF-JWT session history for %s: %s", session_id, e)
+        elif provided_session_id:
             if not self._api_key:
                 logger.warning(
                     "Session continuation via X-Hermes-Session-Id rejected: "
