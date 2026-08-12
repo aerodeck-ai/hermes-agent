@@ -50,7 +50,15 @@ _PATTERNS: List[Tuple[str, str, str]] = [
     # Anchored on C2 vocabulary. "register as a node" appears in legitimate distributed-systems
     # docs, so this is WARN not block: a researcher reading the Brainworm post keeps their session.
     (r'register\s+(as\s+)?a?\s*node', "c2_node_registration", "context"),
-    (r'(heartbeat|beacon|check[\s\-]?in)\s+(to|with)\s+', "c2_heartbeat", "context"),
+    # Narrowed 2026-08-10: the bare verb+preposition form matched ordinary
+    # infrastructure prose ("writes a heartbeat to its own logs/findings.log"),
+    # which BLOCKED a local AGENTS.md in production.  Require an actual remote
+    # target so genuine C2 beaconing still matches.
+    (r'(heartbeat|beacon|check[\s\-]?in)\s+(to|with)\s+'
+     r'(?:the\s+)?(?:[a-z0-9-]+\.[a-z]{2,}|https?://|\d{1,3}(?:\.\d{1,3}){3}'
+     r'|c2\b|command[\s-]and[\s-]control|remote\s+(?:server|host|endpoint)'
+     r'|(?:our|the|your)\s+(?:server|controller|node|network)\b)',
+     "c2_heartbeat", "context"),
     (r'pull\s+(down\s+)?(?:new\s+)?task(?:ing|s)?\b', "c2_task_pull", "context"),
     (r'connect\s+to\s+the\s+network\b', "c2_network_connect", "context"),
     # C2-specific verbs avoid the broader "you must X" false positive.
