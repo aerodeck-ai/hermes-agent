@@ -463,6 +463,18 @@ function liveLaneForRepo(repoRoot: string, session: SessionInfo): null | Sidebar
   return { id: branchLaneId(repoRoot, branch), isMain: true, label: branch, path: repoRoot, sessions: [] }
 }
 
+// A plain (non-git) folder's backend lane: the path heuristic names it after
+// the folder and keys it by its path, so a live session's computed branch lane
+// (`<root>::branch::main`) matches neither its id nor its label. When the
+// snapshot serves exactly ONE main lane for that root and it is not a
+// branch-style lane, that IS the folder lane — join it instead of fabricating
+// a phantom trunk lane beside it.
+const folderMainLane = (lanes: SidebarSessionGroup[], rootKey: string): SidebarSessionGroup | undefined => {
+  const roots = lanes.filter(g => g.isMain && !g.id.includes('::branch::') && pathKey(g.path) === rootKey)
+
+  return roots.length === 1 ? roots[0] : undefined
+}
+
 const NO_REMOVED: ReadonlySet<string> = new Set()
 
 /**
@@ -542,7 +554,8 @@ export function overlayRepoLanes(
         (placed.isMain
           ? lanes.find(g => g.isMain && g.label.toLowerCase() === placed.label.toLowerCase())
           : undefined) ??
-        (!placed.isMain && placedKey ? lanes.find(g => pathKey(g.path) === placedKey) : undefined)
+        (!placed.isMain && placedKey ? lanes.find(g => pathKey(g.path) === placedKey) : undefined) ??
+        (placed.isMain && placedKey ? folderMainLane(lanes, placedKey) : undefined)
 
       if (!lane) {
         lane = { ...placed, sessions: [] }
