@@ -25,7 +25,9 @@ returns the worktree's own root, which is why the client double-counted them).
 
 from __future__ import annotations
 
+import os
 import re
+from functools import lru_cache
 from typing import Any, Callable, Optional
 
 # A cwd -> git identity resolver. Returns ``{"repo_root", "worktree_root"}`` where
@@ -68,13 +70,33 @@ def _is_windows_path(path: str) -> bool:
     return bool(re.match(r"^[A-Za-z]:[/\\]", value)) or value.startswith(("\\", "//"))
 
 
+@lru_cache(maxsize=4096)
+def _resolve_local(path: str) -> str:
+    """Collapse symlinked spellings of the same local directory for comparisons.
+
+    A profile relocated onto another mount is reachable through both its home
+    symlink and the physical mount path; sessions record whichever spelling the
+    writer resolved, which used to split one folder into two repo groups.
+    POSIX-only and best-effort: Windows, remote, and unknown paths come back
+    unchanged, and display paths / emitted IDs keep their original spelling.
+    """
+    if not path or _is_windows_path(path):
+        return path
+    try:
+        real = os.path.realpath(path)
+    except OSError:
+        return path
+    return real if real != path and os.path.isdir(real) else path
+
+
 def _comparison_segments(path: str) -> list[str]:
     """Path segments suitable for identity comparisons on any host.
 
     Windows paths remain case-insensitive even when tests or remote backends run
-    on POSIX. Display paths and emitted IDs keep their original spelling.
+    on POSIX. Local symlinked spellings collapse to one identity. Display paths
+    and emitted IDs keep their original spelling.
     """
-    segs = _segments(path)
+    segs = _segments(_resolve_local((path or "").strip()))
     return [segment.casefold() for segment in segs] if _is_windows_path(path) else segs
 
 
