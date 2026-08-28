@@ -5204,7 +5204,7 @@ def run_conversation(
                         pass
                 elif _think_text:
                     try:
-                        agent.tool_progress_callback("reasoning.available", "_thinking", _think_text[:500], None)
+                        agent.tool_progress_callback("reasoning.available", "_thinking", _think_text[:4000], None)
                     except Exception:
                         pass
             

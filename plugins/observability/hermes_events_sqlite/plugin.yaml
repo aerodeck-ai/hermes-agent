@@ -1,0 +1,12 @@
+name: hermes_events_sqlite
+version: "1.0.0"
+description: "Write coarse Hermes lifecycle telemetry into the legacy per-profile hermes_events.db SQLite schema. Local only; no prompts, outputs, tool args, or network export."
+author: Aerodeck
+hooks:
+  - on_session_start
+  - on_session_end
+  - on_session_finalize
+  - on_session_reset
+  - post_api_request
+  - api_request_error
+  - post_tool_call

@@ -11,7 +11,9 @@ either is missing the hooks are inert.
 Required env vars (set via ``hermes tools`` or ~/.hermes/.env):
   HERMES_LANGFUSE_PUBLIC_KEY  - Langfuse project public key (pk-lf-...)
   HERMES_LANGFUSE_SECRET_KEY  - Langfuse project secret key (sk-lf-...)
-  HERMES_LANGFUSE_BASE_URL    - Langfuse server URL (default: https://cloud.langfuse.com)
+  HERMES_LANGFUSE_BASE_URL    - Langfuse server URL. REQUIRED, and must resolve to a
+                                private/tailnet address (e.g. http://100.74.200.84:3003).
+                                There is NO cloud default: unset or public raises at import.
 
 Optional env vars:
   HERMES_LANGFUSE_ENV         - environment tag (e.g. "production", "local")
@@ -38,6 +40,78 @@ try:
 except Exception:  # pragma: no cover - fail-open when optional dep is missing
     Langfuse = None
     propagate_attributes = None
+
+
+# ---------------------------------------------------------------------------
+# LANGFUSE EGRESS LOCK - Henry ruling 2026-07-27 ("keep it internal": HARD-FAIL).
+#
+# This plugin used to default base_url to https://cloud.langfuse.com when
+# HERMES_LANGFUSE_BASE_URL was unset. Enabling the plugin without that var would
+# therefore ship whole conversations, prompts, tool I/O and responses to Langfuse
+# US cloud. Three live profiles enable this plugin and two of them set no base URL,
+# so the only thing preventing egress was the langfuse SDK happening not to be
+# installed - an accident, not a control.
+#
+# There is now NO cloud default. An unset/empty/public host raises at IMPORT time,
+# which is when the plugin is enabled - loud at startup, not silent at first trace.
+# A public name of ours (langfuse.aerodeck.ai -> Cloudflare) is refused too; use the
+# tailnet IP. Same policy as /home/ubuntu/bin/langfuse-host-guard on the LiteLLM side.
+# ---------------------------------------------------------------------------
+
+_LANGFUSE_ENV_VARS = ("HERMES_LANGFUSE_BASE_URL", "LANGFUSE_BASE_URL", "LANGFUSE_HOST")
+
+
+def _assert_internal_langfuse_host() -> str:
+    """Return the configured Langfuse base URL, or raise if it could egress offsite."""
+    import ipaddress
+    import socket
+    from urllib.parse import urlparse
+
+    raw = ""
+    for var in _LANGFUSE_ENV_VARS:
+        raw = (os.environ.get(var) or "").strip()
+        if raw:
+            break
+
+    def refuse(why: str):
+        raise RuntimeError(
+            "LANGFUSE EGRESS LOCK - refusing to enable observability/langfuse: "
+            + why
+            + ". Set HERMES_LANGFUSE_BASE_URL to the estate's own tailnet Langfuse "
+            "(e.g. http://100.74.200.84:3003). There is deliberately no cloud default: "
+            "an unset host used to mean prompts and responses were sent to Langfuse US "
+            "cloud. To run without tracing, disable the plugin - do not unset the host."
+        )
+
+    if not raw:
+        refuse("no Langfuse host is set (tried " + ", ".join(_LANGFUSE_ENV_VARS) + ")")
+
+    parsed = urlparse(raw if "://" in raw else "http://" + raw)
+    host = parsed.hostname
+    if not host:
+        refuse("host %r does not parse" % raw)
+
+    try:
+        addrs = sorted({ai[4][0] for ai in socket.getaddrinfo(host, None)})
+    except socket.gaierror as exc:
+        refuse("host %r does not resolve (%s)" % (raw, exc))
+
+    def _private(a: str) -> bool:
+        ip = ipaddress.ip_address(a)
+        # 100.64.0.0/10 is Tailscale's CGNAT range; python does not call it private.
+        if ip.version == 4:
+            return ip.is_private or ip in ipaddress.ip_network("100.64.0.0/10")
+        return ip.is_private or ip.is_loopback
+
+    public = [a for a in addrs if not _private(a)]
+    if public:
+        refuse("host %r resolves to PUBLIC address(es) %s - that is offsite"
+               % (raw, ", ".join(public)))
+    return raw
+
+
+# Raises at import, i.e. exactly when a profile enables this plugin.
+_LANGFUSE_BASE_URL = _assert_internal_langfuse_host()
 
 
 @dataclass
@@ -198,7 +272,9 @@ def _get_langfuse() -> Optional[Langfuse]:
         _LANGFUSE_CLIENT = _INIT_FAILED
         return None
 
-    base_url = _env("HERMES_LANGFUSE_BASE_URL") or _env("LANGFUSE_BASE_URL") or "https://cloud.langfuse.com"
+    # EGRESS LOCK: no cloud default. Re-validated here so a mid-process env change
+    # cannot repoint tracing offsite after the import-time check passed.
+    base_url = _assert_internal_langfuse_host()
     environment = _env("HERMES_LANGFUSE_ENV") or _env("LANGFUSE_ENV")
     release = _env("HERMES_LANGFUSE_RELEASE") or _env("LANGFUSE_RELEASE")
     sample_rate = _env("HERMES_LANGFUSE_SAMPLE_RATE")

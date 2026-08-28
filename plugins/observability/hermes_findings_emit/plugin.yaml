@@ -1,0 +1,10 @@
+name: hermes_findings_emit
+version: "1.0.0"
+description: "S2 §2 — emit hermes_findings rows on every tool/LLM call so /flow can render real DAGs. Populates the S2-added columns (intent_id, span_id, parent_span_id, source_app, kind, label, mcp_server, tool_name, error_message, duration_ms)."
+author: BerlAI (S2)
+requires_env: []
+hooks:
+  - pre_llm_call
+  - post_llm_call
+  - pre_tool_call
+  - post_tool_call
