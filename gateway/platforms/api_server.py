@@ -672,9 +672,17 @@ class ResponseStore:
             """CREATE TABLE IF NOT EXISTS responses (
                 response_id TEXT PRIMARY KEY,
                 data TEXT NOT NULL,
-                accessed_at REAL NOT NULL
+                accessed_at REAL NOT NULL,
+                owner TEXT
             )"""
         )
+        # Additive migration for stores created before `owner` existed.  Rows
+        # already there keep owner NULL and are treated as unowned by the
+        # ownership gate in _handle_responses.
+        try:
+            self._conn.execute("ALTER TABLE responses ADD COLUMN owner TEXT")
+        except sqlite3.OperationalError:
+            pass  # column already present
         self._conn.execute(
             """CREATE TABLE IF NOT EXISTS conversations (
                 name TEXT PRIMARY KEY,
@@ -734,11 +742,29 @@ class ResponseStore:
             self._conn.commit()
             return None
 
-    def put(self, response_id: str, data: Dict[str, Any]) -> None:
+    #: Returned by ``owner_of`` when there is no such response at all, so a
+    #: caller can tell "missing" from "present but unowned" (owner is None).
+    MISSING = object()
+
+    def owner_of(self, response_id: str) -> Any:
+        """Return the stored owner for ``response_id``.
+
+        ``None`` means the row exists but has no recorded owner (created before
+        this column, or by an unauthenticated local-dev path).  ``MISSING``
+        means there is no such row.
+        """
+        row = self._conn.execute(
+            "SELECT owner FROM responses WHERE response_id = ?", (response_id,)
+        ).fetchone()
+        if row is None:
+            return self.MISSING
+        return row[0]
+
+    def put(self, response_id: str, data: Dict[str, Any], owner: Optional[str] = None) -> None:
         """Store a response, evicting the oldest if at capacity."""
         self._conn.execute(
-            "INSERT OR REPLACE INTO responses (response_id, data, accessed_at) VALUES (?, ?, ?)",
-            (response_id, json.dumps(data, default=str), time.time()),
+            "INSERT OR REPLACE INTO responses (response_id, data, accessed_at, owner) VALUES (?, ?, ?, ?)",
+            (response_id, json.dumps(data, default=str), time.time(), owner),
         )
         # Evict oldest entries beyond max_size
         count = self._conn.execute("SELECT COUNT(*) FROM responses").fetchone()[0]
@@ -1879,45 +1905,92 @@ class APIServerAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _extract_cf_jwt_sub(request: "web.Request") -> Optional[str]:
-        """Extract the ``sub`` claim from a Cloudflare Access JWT.
+        """Return the ``sub`` of a FULLY VERIFIED Cloudflare Access JWT.
 
-        The JWT in ``Cf-Access-Jwt-Assertion`` has already been validated at
-        the CF edge before the request reaches this server.  We do NOT re-verify
-        the signature here — we rely on the perimeter guarantee.  We only decode
-        the payload to extract the stable ``sub`` (email or opaque ID) so we can
-        derive a server-side session identity.
+        Verification is delegated to :mod:`gateway.cf_access`: RS256 signature
+        against the team's published JWKS, plus ``iss``, ``aud`` (against the
+        allowed audience set), ``exp``/``iat``/``nbf``, and the presence of
+        ``sub``.  Anything that does not pass every check returns ``None``.
 
-        Returns the ``sub`` string on success, or ``None`` if the header is
-        absent, malformed, or lacks a ``sub`` claim.
+        This replaces an unverified base64 decode.  That earlier version
+        trusted the payload on the strength of a comment claiming the CF edge
+        had already validated it — but nothing forced traffic through the edge,
+        so ``<junk>.<b64 {"sub": "victim@..."}>.<junk>`` was accepted verbatim
+        and landed the caller on the victim's derived session.
 
-        NOTE: this is intentionally a best-effort decode.  A missing or
-        unparseable JWT falls through to the Bearer-token-only path (local dev /
-        non-CF deployments) rather than hard-rejecting the request.
+        BLOCKING: the first verification for an unseen key id fetches the JWKS.
+        Prefer :meth:`_resolve_cf_identity` from a request handler, which does
+        the work off the event loop.
         """
+        from gateway.cf_access import get_verifier
+
         raw_jwt = request.headers.get("Cf-Access-Jwt-Assertion", "").strip()
         if not raw_jwt:
             return None
+        return get_verifier().verify_sub(raw_jwt)
 
-        try:
-            import base64
-            # JWT is three dot-separated base64url segments: header.payload.sig
-            parts = raw_jwt.split(".")
-            if len(parts) != 3:
-                return None
+    @property
+    def _require_cf_jwt(self) -> bool:
+        """Whether a missing CF Access JWT must be refused on identity routes.
 
-            # Base64url decode payload (add padding as needed)
-            payload_b64 = parts[1]
-            padding = 4 - len(payload_b64) % 4
-            if padding != 4:
-                payload_b64 += "=" * padding
-            payload_bytes = base64.urlsafe_b64decode(payload_b64)
-            payload = json.loads(payload_bytes.decode("utf-8"))
-            sub = payload.get("sub") or payload.get("email")
-            if sub and isinstance(sub, str):
-                return sub
-        except Exception:
-            pass
-        return None
+        Defaults ON whenever this gateway is bound beyond loopback, because
+        there the caller-controlled ``X-Hermes-Session-Id`` path is reachable
+        by anyone on those networks.  Override with
+        ``HERMES_CF_ACCESS_REQUIRE_JWT``.
+        """
+        from gateway.cf_access import require_jwt_enabled
+
+        return require_jwt_enabled(is_network_accessible(self._host))
+
+    async def _resolve_cf_identity(
+        self, request: "web.Request"
+    ) -> tuple[Optional[str], Optional["web.Response"]]:
+        """Resolve the verified caller identity, or an error response.
+
+        Returns ``(cf_sub, None)`` when a valid JWT is present,
+        ``(None, None)`` when there is no JWT and none is required (the legacy
+        local-dev path), and ``(None, <401>)`` otherwise.
+
+        A JWT that is PRESENT but does not verify is refused unconditionally,
+        even when require-mode is off.  Letting a bad token fall through to the
+        caller-controlled header path is the fail-open hole this closes.
+        """
+        from gateway.cf_access import (
+            aresolve_identity,
+            REASON_INVALID,
+            REASON_MISSING,
+        )
+
+        raw_jwt = request.headers.get("Cf-Access-Jwt-Assertion", "")
+        cf_sub, reason = await aresolve_identity(
+            raw_jwt, require=self._require_cf_jwt
+        )
+        if reason is None:
+            return cf_sub, None
+
+        if reason == REASON_INVALID:
+            logger.warning(
+                "Rejected a Cf-Access-Jwt-Assertion that failed verification "
+                "on %s (signature/aud/iss/exp). Refusing rather than falling "
+                "back to the caller-supplied session header.",
+                request.path,
+            )
+            message = "Cloudflare Access JWT failed verification"
+        else:  # REASON_MISSING
+            logger.warning(
+                "Refused %s: no Cf-Access-Jwt-Assertion and this gateway "
+                "requires one (bound to %s).",
+                request.path,
+                self._host,
+            )
+            message = (
+                "This endpoint requires a Cloudflare Access JWT. "
+                "Set HERMES_CF_ACCESS_REQUIRE_JWT=0 only on a loopback-only "
+                "deployment."
+            )
+        return None, web.json_response(
+            _openai_error(message, code=reason), status=401
+        )
 
     def _derive_session_id_from_cf_jwt(self, cf_sub: str, route: str) -> str:
         """Build a deterministic, server-derived session ID from JWT identity.
@@ -2861,10 +2934,15 @@ class APIServerAdapter(BasePlatformAdapter):
         from gateway.role_map import RoleMap
         from hermes_cli.profiles import get_profile_dir, get_active_profile_name
         profile_name = get_active_profile_name() or "default"
+        # from_profile_dir now RAISES on a present-but-broken config rather
+        # than returning None, so keep the two apart here: "no config" is the
+        # legacy full-catalog state, "broken config" is a defect to report.
+        role_map_broken = False
         try:
             role_map = RoleMap.from_profile_dir(Path(get_profile_dir(profile_name)))
         except Exception as exc:
             role_map = None
+            role_map_broken = True
             load_error = str(exc)
         else:
             load_error = None
@@ -2874,7 +2952,16 @@ class APIServerAdapter(BasePlatformAdapter):
         identity = request.query.get("identity")
         if not identity:
             try:
-                cf_sub = self._extract_cf_jwt_sub(request)
+                # Verification does a (cached) JWKS fetch — keep it off the
+                # event loop.
+                from gateway.cf_access import get_verifier
+
+                raw_jwt = request.headers.get("Cf-Access-Jwt-Assertion", "").strip()
+                cf_sub = (
+                    await asyncio.to_thread(get_verifier().verify_sub, raw_jwt)
+                    if raw_jwt
+                    else None
+                )
                 identity = cf_sub or "anonymous"
             except Exception:
                 identity = "anonymous"
@@ -2886,7 +2973,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 "role_map_active": False,
                 "profile": profile_name,
                 "load_error": load_error,
-                "note": "role_map = None on this profile (yamls absent OR init failed). Legacy full-catalog dispatch.",
+                "note": (
+                    "role-map config is PRESENT but failed to load. This is a "
+                    "defect, not the legacy path — fix or remove the yamls."
+                    if role_map_broken else
+                    "No role-map yamls on this profile. Legacy full-catalog dispatch."
+                ),
             })
 
         try:
@@ -3141,7 +3233,131 @@ class APIServerAdapter(BasePlatformAdapter):
             return {}, web.json_response(_openai_error("Request body must be a JSON object"), status=400)
         return body, None
 
-    async def _get_existing_session_or_404(self, session_id: str) -> tuple[Optional[Dict[str, Any]], Optional["web.Response"]]:
+    def _cf_session_prefix(self, cf_sub: str) -> str:
+        """The ``api_server:<safe_sub>:`` prefix every session this identity
+        derives will carry.  Must stay in step with
+        :meth:`_derive_session_id_from_cf_jwt`."""
+        safe_sub = re.sub(r"[^a-zA-Z0-9@._+-]", "_", cf_sub)
+        return f"api_server:{safe_sub}:"
+
+    @staticmethod
+    def _strict_session_ownership() -> bool:
+        """Whether a verified identity may only touch sessions it owns.
+
+        On by default.  ``HERMES_CF_ACCESS_STRICT_SESSION_OWNERSHIP=0`` relaxes
+        it to log-and-allow, which an operator may need while backfilling
+        ``user_id`` on sessions created before this check existed — those rows
+        have no recorded owner and are refused under the strict default.
+        """
+        raw = os.environ.get(
+            "HERMES_CF_ACCESS_STRICT_SESSION_OWNERSHIP", ""
+        ).strip().lower()
+        return raw not in {"0", "false", "no", "off"}
+
+    def _session_ownership_error(
+        self,
+        cf_sub: Optional[str],
+        session_id: str,
+        session: Dict[str, Any],
+    ) -> Optional["web.Response"]:
+        """Refuse a session that does not belong to the verified caller.
+
+        Without this, every ``/api/sessions/{session_id}/…`` route took its
+        session id straight from the URL with no ownership check at all — the
+        same CWE-862 smuggling the chat-completions route was hardened against,
+        just via a different door.  A caller holding any valid API key for this
+        gateway could read, continue, fork or delete anyone else's session by
+        naming its id.
+
+        Returns 404 rather than 403 on a mismatch: confirming that someone
+        else's session id exists is itself a disclosure.
+        """
+        if not cf_sub:
+            # No verified identity. Only reachable when require-JWT mode is
+            # off (loopback-only / explicit opt-out), where the API key is the
+            # whole trust boundary — unchanged legacy behaviour.
+            return None
+
+        owner = session.get("user_id")
+        if owner and owner == cf_sub:
+            return None
+        if not owner and session_id.startswith(self._cf_session_prefix(cf_sub)):
+            # Derived-id sessions predate the user_id backfill but are still
+            # provably this identity's: only this sub produces that prefix.
+            return None
+
+        if not self._strict_session_ownership():
+            logger.warning(
+                "Session %r has owner=%r but was reached by sub=%r; allowing "
+                "because HERMES_CF_ACCESS_STRICT_SESSION_OWNERSHIP is off.",
+                session_id, owner, cf_sub,
+            )
+            return None
+
+        logger.warning(
+            "Refused cross-identity session access: sub=%r requested session "
+            "%r (owner=%r).",
+            cf_sub, session_id, owner,
+        )
+        return web.json_response(
+            _openai_error(
+                f"Session not found: {session_id}", code="session_not_found"
+            ),
+            status=404,
+        )
+
+    def _response_ownership_error(
+        self, cf_sub: Optional[str], response_id: str
+    ) -> Optional["web.Response"]:
+        """Refuse a stored response that does not belong to the verified caller.
+
+        Same gate as :meth:`_session_ownership_error`, for the Responses API's
+        own state.  404 on mismatch, for the same non-disclosure reason.
+        """
+        if not cf_sub:
+            return None
+
+        owner = self._response_store.owner_of(response_id)
+        if owner is ResponseStore.MISSING:
+            # Let the normal not-found path answer; it does not leak ownership.
+            return None
+        if owner == cf_sub:
+            return None
+        if owner is None and not self._strict_session_ownership():
+            logger.warning(
+                "Response %r has no recorded owner and was reached by sub=%r; "
+                "allowing because HERMES_CF_ACCESS_STRICT_SESSION_OWNERSHIP "
+                "is off.",
+                response_id, cf_sub,
+            )
+            return None
+
+        logger.warning(
+            "Refused cross-identity response access: sub=%r requested response "
+            "%r (owner=%r).",
+            cf_sub, response_id, owner,
+        )
+        return web.json_response(
+            _openai_error(
+                f"Response not found: {response_id}", code="response_not_found"
+            ),
+            status=404,
+        )
+
+    async def _get_existing_session_or_404(
+        self, request: "web.Request", session_id: str
+    ) -> tuple[Optional[Dict[str, Any]], Optional["web.Response"]]:
+        """Load a session by id, enforcing caller identity and ownership.
+
+        Every ``/api/sessions/{session_id}/…`` handler funnels through here, so
+        this is the one place the ownership gate has to live for the whole
+        family.  ``request`` is required rather than optional precisely so a
+        new route cannot quietly skip the check.
+        """
+        cf_sub, identity_err = await self._resolve_cf_identity(request)
+        if identity_err is not None:
+            return None, identity_err
+
         db = await self._ensure_session_db_async()
         if db is None:
             return None, web.json_response(_openai_error("Session database unavailable", code="session_db_unavailable"), status=503)
@@ -3152,6 +3368,10 @@ class APIServerAdapter(BasePlatformAdapter):
         session = await asyncio.to_thread(db.get_session, session_id)
         if not session:
             return None, web.json_response(_openai_error(f"Session not found: {session_id}", code="session_not_found"), status=404)
+
+        owner_err = self._session_ownership_error(cf_sub, session_id, session)
+        if owner_err is not None:
+            return None, owner_err
         return session, None
 
     async def _conversation_history_for_session(self, session_id: str) -> List[Dict[str, Any]]:
@@ -3205,6 +3425,12 @@ class APIServerAdapter(BasePlatformAdapter):
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
+        # Stamp the verified identity onto the row as its owner, so the
+        # ownership gate in _get_existing_session_or_404 can let this caller
+        # back in later (and keep everyone else out).
+        cf_sub, identity_err = await self._resolve_cf_identity(request)
+        if identity_err is not None:
+            return identity_err
         body, err = await self._read_json_body(request)
         if err:
             return err
@@ -3261,11 +3487,13 @@ class APIServerAdapter(BasePlatformAdapter):
                 import time as _time
                 conn.execute(
                     """INSERT INTO sessions (
-                       id, source, model, model_config, system_prompt, started_at
-                    ) VALUES (?, ?, ?, ?, ?, ?)""",
+                       id, source, user_id, model, model_config, system_prompt,
+                       started_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
                     (
                         session_id,
                         source,
+                        cf_sub,
                         model_name,
                         json.dumps(model_config) if model_config else None,
                         system_prompt,
@@ -3309,7 +3537,7 @@ class APIServerAdapter(BasePlatformAdapter):
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
-        session, err = await self._get_existing_session_or_404(request.match_info["session_id"])
+        session, err = await self._get_existing_session_or_404(request, request.match_info["session_id"])
         if err:
             return err
         return web.json_response({"object": "hermes.session", "session": self._session_response(session)})
@@ -3320,7 +3548,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
         session_id = request.match_info["session_id"]
-        session, err = await self._get_existing_session_or_404(session_id)
+        session, err = await self._get_existing_session_or_404(request, session_id)
         if err:
             return err
         body, err = await self._read_json_body(request)
@@ -3348,7 +3576,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
         session_id = request.match_info["session_id"]
-        session, err = await self._get_existing_session_or_404(session_id)
+        session, err = await self._get_existing_session_or_404(request, session_id)
         if err:
             return err
         db = await self._ensure_session_db_async()
@@ -3361,7 +3589,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
         session_id = request.match_info["session_id"]
-        _, err = await self._get_existing_session_or_404(session_id)
+        _, err = await self._get_existing_session_or_404(request, session_id)
         if err:
             return err
         db = await self._ensure_session_db_async()
@@ -3379,7 +3607,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
         source_id = request.match_info["session_id"]
-        source, err = await self._get_existing_session_or_404(source_id)
+        source, err = await self._get_existing_session_or_404(request, source_id)
         if err:
             return err
         body, err = await self._read_json_body(request)
@@ -3427,7 +3655,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if key_err is not None:
             return key_err
         session_id = request.match_info["session_id"]
-        session, err = await self._get_existing_session_or_404(session_id)
+        session, err = await self._get_existing_session_or_404(request, session_id)
         if err:
             return err
         body, err = await self._read_json_body(request)
@@ -3544,7 +3772,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if key_err is not None:
             return key_err
         session_id = request.match_info["session_id"]
-        session, err = await self._get_existing_session_or_404(session_id)
+        session, err = await self._get_existing_session_or_404(request, session_id)
         if err:
             return err
         body, err = await self._read_json_body(request)
@@ -3759,7 +3987,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
         session_id = request.match_info["session_id"]
-        _, err = await self._get_existing_session_or_404(session_id)
+        _, err = await self._get_existing_session_or_404(request, session_id)
         if err:
             return err
         body, err = await self._read_json_body(request)
@@ -3863,22 +4091,36 @@ class APIServerAdapter(BasePlatformAdapter):
             return key_err
 
         # ------------------------------------------------------------------
-        # Session identity resolution (Gap 1 fix — CWE-862)
+        # Session identity resolution (CWE-862)
         #
         # Priority order (highest to lowest):
-        #   1. CF Access JWT present  → derive session_id server-side from JWT
-        #      sub.  Any caller-supplied X-Hermes-Session-Id is IGNORED when a
-        #      JWT is present; it cannot override a server-derived identity.
-        #   2. X-Hermes-Session-Id header + API key auth  → session continuation
-        #      (existing behaviour, preserved for local-dev / non-CF paths).
-        #   3. Fingerprint of (system_prompt, first_user_message)  → stateless.
+        #   1. A VERIFIED CF Access JWT → derive session_id server-side from
+        #      the JWT sub.  Any caller-supplied X-Hermes-Session-Id is IGNORED
+        #      when a verified JWT is present.
+        #   2. X-Hermes-Session-Id header + API key auth → session continuation.
+        #      Only reachable when require-JWT mode is OFF, i.e. a loopback-only
+        #      deployment or an explicit HERMES_CF_ACCESS_REQUIRE_JWT=0.
+        #   3. Fingerprint of (system_prompt, first_user_message) → stateless.
         #
-        # The CF-JWT path closes the cross-tenant impersonation hole: a caller
-        # with the Bearer token for profile A cannot hijack profile B's session
-        # by sending X-Hermes-Session-Id: <profile-B-session>.  When CF Access
-        # is in the path, the JWT is server-supplied and non-spoofable.
+        # What the JWT path is and is not:
+        #
+        # It binds the session to an identity this server has CRYPTOGRAPHICALLY
+        # VERIFIED — signature against Cloudflare's published JWKS, plus aud,
+        # iss and exp (see gateway/cf_access.py).  A forged or replayed
+        # assertion is refused outright; it does not fall back to the header.
+        #
+        # It is NOT a claim that the header is unspoofable.  X-Hermes-Session-Id
+        # is caller-controlled and always was.  What stops it being abused is
+        # that on a network-accessible bind require-JWT mode is ON, so path 2
+        # is unreachable — not that the header itself is trustworthy.  An
+        # earlier version of this comment asserted the JWT was "server-supplied
+        # and non-spoofable" while the code below never checked a signature;
+        # that claim was wrong and is the reason this control read as sound for
+        # as long as it did.
         # ------------------------------------------------------------------
-        cf_sub = self._extract_cf_jwt_sub(request)
+        cf_sub, identity_err = await self._resolve_cf_identity(request)
+        if identity_err is not None:
+            return identity_err
         provided_session_id = request.headers.get("X-Hermes-Session-Id", "").strip()
 
         if cf_sub:
@@ -3887,9 +4129,11 @@ class APIServerAdapter(BasePlatformAdapter):
             session_id = self._derive_session_id_from_cf_jwt(cf_sub, route)
             if provided_session_id and provided_session_id != session_id:
                 logger.warning(
-                    "X-Hermes-Session-Id %r overridden by CF JWT identity for sub=%r; "
-                    "derived session_id=%r. Cross-tenant impersonation attempt blocked.",
-                    provided_session_id, cf_sub, session_id,
+                    "Ignoring caller-supplied X-Hermes-Session-Id %r on %s: the "
+                    "verified CF Access identity derives session_id=%r. The "
+                    "caller may simply be a stale client, so this is a "
+                    "mismatch notice, not a proven attack.",
+                    provided_session_id, request.path, session_id,
                 )
             # Load history from state.db for this server-derived id (best-effort).
             try:
@@ -4405,6 +4649,7 @@ class APIServerAdapter(BasePlatformAdapter):
         store: bool,
         session_id: str,
         gateway_session_key: Optional[str] = None,
+        owner: Optional[str] = None,
     ) -> "web.StreamResponse":
         """Write an SSE stream for POST /v1/responses (OpenAI Responses API).
 
@@ -4514,7 +4759,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "conversation_history": conversation_history_snapshot,
                 "instructions": instructions,
                 "session_id": session_id_snapshot or session_id,
-            })
+            }, owner=owner)
             if conversation:
                 self._response_store.set_conversation(conversation, response_id)
 
@@ -5032,6 +5277,19 @@ class APIServerAdapter(BasePlatformAdapter):
             previous_response_id = self._response_store.get_conversation(conversation)
             # No error if conversation doesn't exist yet — it's a new conversation
 
+        # Identity gate (CWE-862).  /v1/responses is stateful: previous_response_id
+        # (and a conversation name, which resolves to one) replays a stored
+        # transcript.  The chat-completions route was hardened against session
+        # smuggling and this one was not, so the same hijack worked here by
+        # naming someone else's response id instead of their session id.
+        cf_sub, identity_err = await self._resolve_cf_identity(request)
+        if identity_err is not None:
+            return identity_err
+        if previous_response_id:
+            chain_err = self._response_ownership_error(cf_sub, previous_response_id)
+            if chain_err is not None:
+                return chain_err
+
         # Normalize input to message list
         input_messages: List[Dict[str, Any]] = []
         if isinstance(raw_input, str):
@@ -5198,6 +5456,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 store=store,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                owner=cf_sub,
             )
 
         async def _compute_response():
@@ -5301,7 +5560,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "conversation_history": full_history,
                 "instructions": instructions,
                 "session_id": _effective_session_id,
-            })
+            }, owner=cf_sub)
             # Update conversation mapping so the next request with the same
             # conversation name automatically chains to this response
             if conversation:
@@ -5322,7 +5581,14 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
 
+        cf_sub, identity_err = await self._resolve_cf_identity(request)
+        if identity_err is not None:
+            return identity_err
+
         response_id = request.match_info["response_id"]
+        owner_err = self._response_ownership_error(cf_sub, response_id)
+        if owner_err is not None:
+            return owner_err
         stored = self._response_store.get(response_id)
         if stored is None:
             return web.json_response(_openai_error(f"Response not found: {response_id}"), status=404)
@@ -5335,7 +5601,14 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
 
+        cf_sub, identity_err = await self._resolve_cf_identity(request)
+        if identity_err is not None:
+            return identity_err
+
         response_id = request.match_info["response_id"]
+        owner_err = self._response_ownership_error(cf_sub, response_id)
+        if owner_err is not None:
+            return owner_err
         deleted = self._response_store.delete(response_id)
         if not deleted:
             return web.json_response(_openai_error(f"Response not found: {response_id}"), status=404)
@@ -6191,6 +6464,16 @@ class APIServerAdapter(BasePlatformAdapter):
 
         instructions = body.get("instructions")
         previous_response_id = body.get("previous_response_id")
+
+        # Identity gate (CWE-862).  /v1/runs chains through previous_response_id
+        # exactly as /v1/responses does, so it needs the same ownership check.
+        cf_sub, identity_err = await self._resolve_cf_identity(request)
+        if identity_err is not None:
+            return identity_err
+        if previous_response_id:
+            chain_err = self._response_ownership_error(cf_sub, previous_response_id)
+            if chain_err is not None:
+                return chain_err
 
         # Accept explicit conversation_history from the request body.
         # Precedence: explicit conversation_history > previous_response_id.

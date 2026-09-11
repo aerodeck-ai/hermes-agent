@@ -26,6 +26,14 @@ import yaml
 logger = logging.getLogger(__name__)
 
 
+class RoleMapLoadError(RuntimeError):
+    """A role-map config is present but could not be read.
+
+    Raised instead of returning None so a malformed restrictor cannot
+    degrade into "no restrictions at all".
+    """
+
+
 class RoleMap:
     """Per-profile role resolution + tool-catalog filter.
 
@@ -51,9 +59,16 @@ class RoleMap:
     def from_profile_dir(cls, profile_dir: Path) -> Optional["RoleMap"]:
         """Load from <profile_dir>/config/role-map.yaml + role-tools.yaml.
 
-        Returns None when either file is absent — caller falls back to
-        legacy full-catalog behaviour. Never raises; parse errors are
-        logged and treated as absent.
+        Returns None when either file is ABSENT — the caller falls back to
+        legacy full-catalog behaviour, which is the documented "no role map
+        configured" state.
+
+        A PRESENT-but-unparseable file is a different thing and RAISES.  It
+        used to be swallowed into the same ``return None``, which meant a
+        stray space in role-map.yaml silently promoted every caller to the
+        full tool catalog — the failure mode of a broken restrictor must
+        never be "no restrictions". Operators who genuinely want the legacy
+        path should remove the files, not break them.
         """
         role_map_path = profile_dir / "config" / "role-map.yaml"
         role_tools_path = profile_dir / "config" / "role-tools.yaml"
@@ -65,12 +80,15 @@ class RoleMap:
             role_map = cls._load_yaml(role_map_path)
             role_tools = cls._load_yaml(role_tools_path)
         except Exception as exc:
-            logger.warning(
-                "role-map load failed for %s — falling back to full catalog: %s",
+            logger.error(
+                "role-map load FAILED for %s: %s. Refusing to fall back to the "
+                "full tool catalog — fix or remove the file.",
                 profile_dir,
                 exc,
             )
-            return None
+            raise RoleMapLoadError(
+                f"role-map config present but unreadable in {profile_dir}: {exc}"
+            ) from exc
 
         profile_name = profile_dir.name
         return cls(role_map, role_tools, profile_name)
