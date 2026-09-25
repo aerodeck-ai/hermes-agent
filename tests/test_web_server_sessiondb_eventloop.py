@@ -83,7 +83,7 @@ def test_bulk_delete_sessiondb_work_runs_off_event_loop(monkeypatch):
         def close(self):
             db_threads.append(threading.get_ident())
 
-    monkeypatch.setattr(web_server, "_open_session_db_for_profile", lambda profile=None: _DB())
+    monkeypatch.setattr(web_server, "_open_session_db_for_profile", lambda profile=None, **_kw: _DB())
 
     result = asyncio.run(
         web_server.bulk_delete_sessions_endpoint(
