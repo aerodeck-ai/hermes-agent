@@ -11421,7 +11421,7 @@ async def _read_session_import_body(request: Request) -> bytes:
 
 
 def _import_sessions_for_profile(profile: Optional[str], sessions: List[Dict[str, Any]]) -> Dict[str, Any]:
-    db = _open_session_db_for_profile(profile)
+    db = _open_session_db_for_profile(profile, write=True)
     try:
         return db.import_sessions(sessions)
     finally:
@@ -11471,7 +11471,7 @@ async def bulk_delete_sessions_endpoint(body: BulkDeleteSessions):
             detail="ids must contain at most 500 entries",
         )
     def _delete() -> int:
-        db = _open_session_db_for_profile(body.profile)
+        db = _open_session_db_for_profile(body.profile, write=True)
         try:
             return db.delete_sessions(body.ids)
         finally:
@@ -11546,7 +11546,7 @@ async def delete_empty_sessions_endpoint(profile: Optional[str] = None):
     the two delete endpoints' DB-vs-disk behaviour consistent.
     """
     def _delete() -> int:
-        db = _open_session_db_for_profile(profile)
+        db = _open_session_db_for_profile(profile, write=True)
         try:
             return db.delete_empty_sessions()
         finally:
@@ -11587,19 +11587,29 @@ async def get_session_stats(profile: Optional[str] = None):
         db.close()
 
 
-def _open_session_db_for_profile(profile: Optional[str]):
-    """Open a SessionDB for read paths, optionally for another profile.
+def _open_session_db_for_profile(profile: Optional[str], *, write: bool = False):
+    """Open a SessionDB, optionally for another profile.
 
     ``profile`` None/empty → this process's own ``state.db`` (the common,
-    single-profile case). A named profile opens that profile's on-disk
-    ``state.db`` directly so the primary backend can serve cross-profile reads
-    (transcripts, detail) without spawning that profile's backend.
+    single-profile case), opened exactly as before. A named profile opens that
+    profile's on-disk ``state.db`` directly so the primary backend can serve
+    cross-profile reads (transcripts, detail) without spawning that profile's
+    backend.
+
+    Cross-profile opens are READ-ONLY unless the caller passes ``write=True``.
+    Another profile's store is owned by that profile's gateway, often running
+    as a different OS user. A read-write connection from this dashboard can
+    checkpoint and unlink that store's WAL while the gateway still holds it,
+    leaving the gateway writing into a deleted WAL (split brain, then
+    "database disk image is malformed"). Observed on aerodeck 2026-09-25,
+    aerodeck-ai/estate-work#3833. Only explicit user write actions (import,
+    delete) take the read-write path.
     """
     from hermes_state import SessionDB
     if not profile:
         return SessionDB()
     _name, home = _cron_profile_home(profile)
-    return SessionDB(db_path=Path(home) / "state.db")
+    return SessionDB(db_path=Path(home) / "state.db", read_only=not write)
 
 
 # In-process throttle for the opportunistic auto-archive trigger, keyed by
@@ -11746,7 +11756,7 @@ async def delete_session_endpoint(session_id: str, profile: Optional[str] = None
     # opening its state.db directly. Remote profiles never reach here — the
     # desktop routes their DELETE to the remote backend. Omit for current/default.
     def _delete():
-        db = _open_session_db_for_profile(profile)
+        db = _open_session_db_for_profile(profile, write=True)
         try:
             # Resolve exact ids / unique prefixes like every other session endpoint
             # (detail, messages, rename, export all do). A session that no longer
@@ -11788,7 +11798,7 @@ async def rename_session_endpoint(session_id: str, body: SessionRename):
     session from the auto-archive sweep). Any field may be omitted. ``profile``
     targets another profile's session.
     """
-    db = _open_session_db_for_profile(body.profile)
+    db = _open_session_db_for_profile(body.profile, write=True)
     try:
         sid = db.resolve_session_id(session_id)
         if not sid:
@@ -11888,7 +11898,7 @@ def _prune_sessions(body: SessionPrune):
     if has_window or (_attr_filters_set and not _older_than_explicit):
         _effective_older_than = None
     profile_home = _cron_profile_home(body.profile)[1] if body.profile else get_hermes_home()
-    db = _open_session_db_for_profile(body.profile)
+    db = _open_session_db_for_profile(body.profile, write=not body.dry_run)
     try:
         filters = dict(
             older_than_days=_effective_older_than,
