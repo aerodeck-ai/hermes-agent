@@ -24,7 +24,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from aiohttp import web
-from aiohttp.test_utils import TestClient, TestServer
+from aiohttp.test_utils import TestClient, TestServer, make_mocked_request
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.api_server import (
@@ -5160,7 +5160,16 @@ class TestSessionDbOffEventLoop:
                 return {"id": session_id, "source": "api_server"}
 
         auth_adapter._session_db = FakeDB()
-        session, err = await auth_adapter._get_existing_session_or_404("sess-x")
+        # _get_existing_session_or_404 now takes the request too, so it can run
+        # the CWE-862 identity/ownership gate for the whole /api/sessions family
+        # in one place. A loopback bind means require-JWT mode is off, so this
+        # request carries no identity and the gate is a no-op — which is what
+        # keeps this offload assertion about threading and nothing else.
+        auth_adapter._host = "127.0.0.1"
+        request = make_mocked_request("GET", "/api/sessions/sess-x")
+        session, err = await auth_adapter._get_existing_session_or_404(
+            request, "sess-x"
+        )
         assert err is None
         assert session["id"] == "sess-x"
         # The blocking DB call must NOT execute on the event-loop thread.
