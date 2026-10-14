@@ -1730,7 +1730,12 @@ def get_plugin_manager() -> PluginManager:
         else:
             manager = _plugin_managers_by_home.get(current_home)
             if manager is None:
-                manager = PluginManager(scope_key=hermes_home_key(current_home))
+                # The optional managed-profile adapter has no auth/token reads of its own.
+                # Before native bootstrap publishes a canonical verifier it returns None,
+                # preserving the metadata-only telemetry fallback.
+                from hermes_cli.managed_profile_telemetry import resolver_for_managed_profile
+                manager = PluginManager(scope_key=hermes_home_key(current_home),
+                                        verified_telemetry_receipt_resolver=resolver_for_managed_profile(current_home))
                 _plugin_managers_by_home[current_home] = manager
             _plugin_manager = manager
     _attach_published_gateway_host(manager)
