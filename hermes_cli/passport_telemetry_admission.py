@@ -25,6 +25,7 @@ _BOUNDARY_KIND = "langfuse-final-export/v2"
 _RUNTIME_MEMBERSHIP = ("aer", "hermes", "aer-hermes")
 _USAGE_AUTHORITIES = frozenset(("gateway", "direct-provider"))
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$")
+_SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
 _ZERO_USAGE = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "cached_tokens": 0}
 _METADATA_FIELDS = frozenset(("model", "provider", "policy_version"))
 _CONTENT_FIELDS = frozenset((
@@ -124,9 +125,16 @@ def _verify_frame(frame: Mapping[str, Any], identity: Mapping[str, str], body: s
         raise TelemetryAdmissionDenied("frame_content_forbidden")
     if frame.get("signature_algorithm") != "Ed25519":
         raise TelemetryAdmissionDenied("signature_algorithm_unsupported")
-    _safe_id(frame.get("passport_issuer"), "passport_issuer")
-    _safe_id(frame.get("receipt_issuer_kid"), "receipt_issuer_kid")
-    if not isinstance(frame.get("expires_at"), int) or frame["expires_at"] <= now:
+    for name in ("decision_call_id", "passport_id", "passport_contract_version", "passport_issuer",
+                 "passport_issuer_kid", "receipt_issuer_kid", "verification_nonce"):
+        _safe_id(frame.get(name), name)
+    if frame.get("passport_signature_valid") is not True:
+        raise TelemetryAdmissionDenied("passport_signature_unverified")
+    if not isinstance(frame.get("request_fingerprint"), str) or not _SHA256.fullmatch(frame["request_fingerprint"]):
+        raise TelemetryAdmissionDenied("request_fingerprint_invalid")
+    if (any(not isinstance(frame.get(name), int) for name in ("issued_at", "verified_at", "expires_at"))
+            or not frame["issued_at"] <= frame["verified_at"] <= frame["expires_at"]
+            or frame["expires_at"] <= now):
         raise TelemetryAdmissionDenied("receipt_expired")
     if (frame.get("policy_decision") != "ALLOW" or frame.get("policy_action") != _ACTION
             or _AUDIENCE not in frame.get("audiences", ()) or _CAPABILITY not in frame.get("capabilities", ())):

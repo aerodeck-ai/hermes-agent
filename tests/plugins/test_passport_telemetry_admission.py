@@ -33,10 +33,19 @@ def _signed_frame(private_key, *, body="approved business body", classification=
     """Independent C1-v2 wire fixture; only the signature is test-local."""
     frame = {
         "schema": "aerodeck.passport-verification-receipt/v2",
+        "decision_call_id": "pdc-000000000001",
+        "passport_id": "passport-000000000001",
+        "passport_contract_version": "aerodeck.passport/v1",
         "passport_issuer": "passport.c1",
+        "passport_issuer_kid": "passport-ed25519-1",
+        "passport_signature_valid": True,
         "receipt_issuer_kid": "c1-ed25519-1",
         "signature_algorithm": "Ed25519",
+        "issued_at": 1_899_999_000,
+        "verified_at": 1_899_999_001,
         "expires_at": 2_000_000_000,
+        "verification_nonce": "nonce-000000000001",
+        "request_fingerprint": "sha256:" + "0" * 64,
         "policy_decision": "ALLOW",
         "policy_action": "langfuse.final-export.emit",
         "audiences": ["langfuse.final-export"],
@@ -66,6 +75,13 @@ def _signed_frame(private_key, *, body="approved business body", classification=
     }
     frame["issuer_signature"] = _b64(private_key.sign(_canonical(frame).encode()))
     return frame, body, classification
+
+
+def _resign(frame, private_key):
+    unsigned = dict(frame)
+    unsigned.pop("issuer_signature", None)
+    unsigned["issuer_signature"] = _b64(private_key.sign(_canonical(unsigned).encode()))
+    return unsigned
 
 
 def _native_context(classification="business", *, session_id="session-0000000001",
@@ -125,6 +141,18 @@ def test_native_admission_rejects_forged_or_mismatched_signed_frame():
             body=body, now=1_900_000_000,
         )
 
+
+def test_native_admission_rejects_re_signed_incomplete_c1_frame():
+    from hermes_cli.passport_telemetry_admission import TelemetryAdmissionDenied, verify_signed_admission
+
+    key = Ed25519PrivateKey.generate()
+    frame, body, _ = _signed_frame(key)
+    frame.pop("request_fingerprint")
+    with pytest.raises(TelemetryAdmissionDenied, match="request_fingerprint"):
+        verify_signed_admission(
+            frame=_resign(frame, key), native_context=_native_context(), issuer_public_key_pem=_public_pem(key),
+            body=body, now=1_900_000_000,
+        )
 
 @pytest.mark.parametrize("classification", ["life", "unknown"])
 def test_life_and_unknown_never_export_body_tool_or_media(classification):
