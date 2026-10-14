@@ -401,6 +401,21 @@ class PluginContext:
         except Exception:
             return "default"
 
+    def verified_telemetry_receipt(self, session_id: str) -> Any:
+        """Read a host-verifier receipt for this session, or ``None``.
+
+        The resolver is constructor-owned by the host admission path; plugins only
+        receive this read-only projection and cannot install a resolver themselves.
+        """
+        resolver = self._manager._verified_telemetry_receipt_resolver
+        if not isinstance(session_id, str) or not session_id or not callable(resolver):
+            return None
+        try:
+            receipt = resolver(session_id)
+            return receipt.plugin_projection(session_id=session_id) if hasattr(receipt, "plugin_projection") else None
+        except Exception:
+            return None
+
     def current_cron_execution(self) -> Any:
         """The cron run executing now (``cron.execution_identity.CronExecution``), else ``None``."""
         from cron.execution_identity import current_cron_execution
@@ -1153,13 +1168,16 @@ def _resolve_hook_callback_timeout() -> float:
 class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
     """Central manager that discovers, loads, and invokes plugins."""
 
-    def __init__(self, scope_key: Optional[str] = None) -> None:
+    def __init__(self, scope_key: Optional[str] = None, *, verified_telemetry_receipt_resolver: Any = None) -> None:
         # Capture the home immutably. Unload can run from a different ambient
         # profile context, but every inverse must target the registration's
         # original scope.  Normalize through hermes_home_key so the scope
         # matches the key the registries store under (normcase on Windows).
         self.scope_key = hermes_home_key(scope_key)
         self.home_path = Path(self.scope_key)
+        # Host admission installs this at construction after canonical Passport verification.
+        # Plugin registration has no setter, so a plugin cannot self-attest a receipt.
+        self._verified_telemetry_receipt_resolver = verified_telemetry_receipt_resolver
         self._discovery_lock = threading.RLock()
         self._discovered: bool = False
         # True once a discovery re-applied plugin secret sources for this home: the per-home snapshot and
