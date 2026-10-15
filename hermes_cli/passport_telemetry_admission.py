@@ -23,14 +23,15 @@ from typing import Any
 
 MANAGED_ADMISSION_CONTRACT = {
     "schema": "aerodeck.passport-final-export-native-admission/v1",
-    "admission_service": "/run/aerodeck/passport-final-export-admission.sock",
-    "issuer_public_key": "/etc/aerodeck/c5/passport-final-export-issuer.pub",
+    "admission_service": "server-owned-c5-final-export",
+    "issuer_public_key": "managed-c5-root-owned-descriptor",
     "service_owns": (
         "issuer_key", "native_profile_session_turn", "replay_ledger",
         "life_unknown_content_stripping", "gateway_direct_usage_authority",
     ),
     "portable_input": "none",
     "portable_export": "none",
+    "endpoint": "not-configured-in-portable-core",
     "status": "managed_boundary_required",
 }
 
