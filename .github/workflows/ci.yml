@@ -346,7 +346,7 @@ jobs:
         with:
           name: ci-timings-report
           path: ci-timings-report.html
-          retention-days: 14
+          retention-days: 1
 
       - name: Build linked review status
         if: hashFiles('ci-timings.json') != ''
@@ -366,7 +366,7 @@ jobs:
         with:
           name: ci-timings-review-status
           path: review-status.json
-          retention-days: 14
+          retention-days: 1
 
       - name: Output summary
         env:

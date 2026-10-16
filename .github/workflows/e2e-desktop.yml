@@ -123,7 +123,7 @@ jobs:
         with:
           name: playwright-report-${{ github.sha }}
           path: apps/desktop/playwright-report
-          retention-days: 14
+          retention-days: 1
           overwrite: true
 
       # ── Upload test results (screenshots, traces, diffs) ───────────────
@@ -134,7 +134,7 @@ jobs:
         with:
           name: playwright-test-results-${{ github.sha }}
           path: apps/desktop/test-results
-          retention-days: 14
+          retention-days: 1
           overwrite: true
 
       # ── Upload just the visual diffs (small, fast to review) ──────────
@@ -148,7 +148,7 @@ jobs:
             apps/desktop/test-results/**/*-diff.png
             apps/desktop/test-results/**/*-actual.png
             apps/desktop/test-results/**/*-expected.png
-          retention-days: 14
+          retention-days: 1
           overwrite: true
           if-no-files-found: ignore
 
@@ -180,7 +180,7 @@ jobs:
         with:
           name: e2e-evidence-${{ github.sha }}
           path: /tmp/e2e-evidence
-          retention-days: 14
+          retention-days: 1
           overwrite: true
           if-no-files-found: error
 
