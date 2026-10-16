@@ -115,26 +115,30 @@ jobs:
           path: apps/desktop/e2e/*-snapshots
           key: visual-baselines-main
 
-      # ── Upload Playwright report (HTML + traces) ──────────────────────
+      # ── Upload Playwright report (HTML + traces), on failure only ─────
+      # The report and the raw results were about 200 MB per run and filled the organisation's
+      # Actions artifact storage (estate-work#3763, ruling github-artifact-quota-hotfix-20261016).
+      # A passing run uploads neither; the small review evidence below is unchanged. These runners
+      # are GitHub-hosted, so they cannot reach the estate's own registry.
       - name: Upload Playwright report
         id: upload-report
-        if: always()
+        if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: playwright-report-${{ github.sha }}
           path: apps/desktop/playwright-report
-          retention-days: 14
+          retention-days: 1
           overwrite: true
 
       # ── Upload test results (screenshots, traces, diffs) ───────────────
       - name: Upload test results
         id: upload-results
-        if: always()
+        if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: playwright-test-results-${{ github.sha }}
           path: apps/desktop/test-results
-          retention-days: 14
+          retention-days: 1
           overwrite: true
 
       # ── Upload just the visual diffs (small, fast to review) ──────────
@@ -148,7 +152,7 @@ jobs:
             apps/desktop/test-results/**/*-diff.png
             apps/desktop/test-results/**/*-actual.png
             apps/desktop/test-results/**/*-expected.png
-          retention-days: 14
+          retention-days: 1
           overwrite: true
           if-no-files-found: ignore
 
@@ -180,7 +184,7 @@ jobs:
         with:
           name: e2e-evidence-${{ github.sha }}
           path: /tmp/e2e-evidence
-          retention-days: 14
+          retention-days: 1
           overwrite: true
           if-no-files-found: error
 
