@@ -51,7 +51,7 @@ jobs:
         with:
           name: skills-index
           path: website/static/api/skills-index.json
-          retention-days: 7
+          retention-days: 1
 
   # Re-trigger the docs deploy so the refreshed index lands on the live site.
   # The deploy itself is owned by deploy-site.yml (which crawls and deploys
