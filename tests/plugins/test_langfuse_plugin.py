@@ -15,6 +15,13 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 PLUGIN_DIR = REPO_ROOT / "plugins" / "observability" / "langfuse"
 
 
+@pytest.fixture(autouse=True)
+def _langfuse_host_set(monkeypatch):
+    """The plugin's egress lock refuses to start with no Langfuse host (no cloud default).
+    These cases use fake clients, so point the host at a local port nothing contacts."""
+    monkeypatch.setenv("HERMES_LANGFUSE_BASE_URL", "http://127.0.0.1:9")
+
+
 # ---------------------------------------------------------------------------
 # Manifest + layout
 # ---------------------------------------------------------------------------
