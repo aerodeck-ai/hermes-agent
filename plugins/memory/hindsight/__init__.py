@@ -350,14 +350,35 @@ def _load_config() -> dict:
     """Load config from profile-scoped path, legacy path, or env vars.
 
     Resolution order:
-      1. $HERMES_HOME/hindsight/config.json  (profile-scoped)
-      2. ~/.hindsight/config.json             (legacy, shared)
-      3. Environment variables
+      1. $HERMES_HOME/profiles/$HERMES_PROFILE/hindsight/config.json
+         when a runtime keeps a shared Hermes home and selects a profile
+      2. $HERMES_HOME/hindsight/config.json
+      3. ~/.hindsight/config.json             (legacy, shared)
+      4. Environment variables
     """
     from pathlib import Path
 
-    # Profile-scoped path (preferred)
-    profile_path = get_hermes_home() / "hindsight" / "config.json"
+    hermes_home = get_hermes_home()
+    profile = os.environ.get("HERMES_PROFILE", "").strip()
+    profile_path = None
+    # A service may deliberately keep HERMES_HOME at the shared credential
+    # root and select its isolated config through HERMES_PROFILE.  Treat the
+    # profile as a path segment, never as a path, before looking below root.
+    if profile and all(char.isalnum() or char in "_-" for char in profile):
+        candidate = hermes_home / "profiles" / profile / "hindsight" / "config.json"
+        try:
+            candidate.relative_to(hermes_home)
+            profile_path = candidate
+        except ValueError:
+            pass
+    if profile_path is not None and profile_path.exists():
+        try:
+            return json.loads(profile_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+    # Direct profile home (preferred for standalone profiles).
+    profile_path = hermes_home / "hindsight" / "config.json"
     if profile_path.exists():
         try:
             return json.loads(profile_path.read_text(encoding="utf-8"))
