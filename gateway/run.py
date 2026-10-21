@@ -2725,10 +2725,28 @@ def _teams_pipeline_plugin_enabled() -> bool:
 
 
 def _gateway_config_home() -> Path:
-    """Return the Hermes home that gateway config reads should use."""
+    """Return the Hermes home that gateway config reads should use.
+
+    A process-wide ``HERMES_PROFILE`` selects its on-disk profile when the
+    gateway is not already executing in a context-local profile scope.  The
+    existence check keeps a stale or malformed environment value from
+    redirecting the API server away from its root configuration.
+    """
     override = get_hermes_home_override()
     if override:
         return Path(override)
+
+    profile = os.environ.get("HERMES_PROFILE", "")
+    if profile and profile != "default":
+        try:
+            from hermes_cli.profiles import validate_profile_name
+
+            validate_profile_name(profile)
+            profile_home = _hermes_home / "profiles" / profile
+            if (profile_home / "config.yaml").is_file():
+                return profile_home
+        except (ImportError, ValueError, OSError):
+            pass
     return _hermes_home
 
 
