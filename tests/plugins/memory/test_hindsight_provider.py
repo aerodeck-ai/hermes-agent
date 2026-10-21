@@ -399,6 +399,23 @@ class TestConfig:
         assert cfg["banks"]["hermes"]["bankId"] == "env-bank"
         assert cfg["banks"]["hermes"]["budget"] == "high"
 
+    def test_config_uses_named_profile_below_shared_home(self, tmp_path, monkeypatch):
+        """A shared credential home must still select the named profile config."""
+        config = tmp_path / "profiles" / "jacob" / "hindsight" / "config.json"
+        config.parent.mkdir(parents=True)
+        config.write_text(json.dumps({"bank_id": "jiddlers", "auto_retain": True}))
+        monkeypatch.setattr("plugins.memory.hindsight.get_hermes_home", lambda: tmp_path)
+        monkeypatch.setenv("HERMES_PROFILE", "jacob")
+
+        assert _load_config() == {"bank_id": "jiddlers", "auto_retain": True}
+
+    def test_config_refuses_profile_path_traversal(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("plugins.memory.hindsight.get_hermes_home", lambda: tmp_path)
+        monkeypatch.setenv("HERMES_PROFILE", "../other")
+        monkeypatch.setenv("HINDSIGHT_BANK_ID", "env-bank")
+
+        assert _load_config()["banks"]["hermes"]["bankId"] == "env-bank"
+
     def test_embedded_profile_env_includes_idle_timeout_from_config(self):
         env = _build_embedded_profile_env({
             "llm_provider": "openai",
