@@ -167,6 +167,41 @@ class TestMultiplexConfigFlag:
         assert scoped_config["display"]["tool_progress"] is False
         assert scoped_config["display"]["interim_assistant_messages"] is False
 
+    def test_gateway_config_loader_honors_profile_environment(self, tmp_path, monkeypatch):
+        """API-server processes select a real configured HERMES_PROFILE."""
+        import gateway.run as gateway_run
+
+        root_home = tmp_path / "root"
+        profile_home = root_home / "profiles" / "jacob"
+        profile_home.mkdir(parents=True)
+        (root_home / "config.yaml").write_text(
+            yaml.safe_dump({"mcp_servers": {}}, sort_keys=False), encoding="utf-8"
+        )
+        (profile_home / "config.yaml").write_text(
+            yaml.safe_dump({"mcp_servers": {"mcphub-smart": {"enabled": True}}}, sort_keys=False),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(gateway_run, "_hermes_home", root_home)
+        monkeypatch.setenv("HERMES_PROFILE", "jacob")
+
+        assert gateway_run._gateway_config_home() == profile_home
+        assert gateway_run._load_gateway_config()["mcp_servers"]["mcphub-smart"]["enabled"] is True
+
+    def test_gateway_config_loader_ignores_missing_profile_environment(self, tmp_path, monkeypatch):
+        """A stale profile environment value must retain the root config."""
+        import gateway.run as gateway_run
+
+        root_home = tmp_path / "root"
+        root_home.mkdir()
+        (root_home / "config.yaml").write_text(
+            yaml.safe_dump({"marker": "root"}, sort_keys=False), encoding="utf-8"
+        )
+        monkeypatch.setattr(gateway_run, "_hermes_home", root_home)
+        monkeypatch.setenv("HERMES_PROFILE", "missing-profile")
+
+        assert gateway_run._gateway_config_home() == root_home
+        assert gateway_run._load_gateway_config()["marker"] == "root"
+
 
 class TestSessionStoreProfileResolution:
     """SessionStore._generate_session_key honors the flag: legacy namespace
